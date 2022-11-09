@@ -7,7 +7,6 @@
 #include "nanosvg.h"
 #include "tesselator.h"
 
-
 void* stdAlloc(void* userData, unsigned int size)
 {
 	int* allocated = ( int*)userData;
@@ -70,6 +69,212 @@ static void key(GLFWwindow* window, int key, int scancode, int action, int mods)
 		cdt = !cdt;
 }
 
+void PrintJson(const char* filename, const float* verts, const int* elems, const int nverts, const int nelems)
+{
+	FILE* fp;
+	char t_json[100];
+	if ((fp = fopen(filename, "wb")) == NULL)
+	{
+		return;
+	}
+	rewind(fp);
+	char EndLine[] = "],\n";
+	char EndMap[] = "]\n";
+	char EndJson[] = "}";
+	char JsonBegin[] = "{\"verts\":[";
+	fwrite(JsonBegin, sizeof(char), strlen(JsonBegin), fp);
+
+	char VertJson[] = "[%f, %f],\n";
+	for (int i = 0; i < nverts; ++i)
+	{
+		sprintf(t_json, VertJson, verts[i * 2], verts[i * 2 + 1]);
+		fwrite(t_json, sizeof(char), strlen(t_json), fp);
+	}
+	fwrite(EndLine, sizeof(char), strlen(EndLine), fp);
+
+	char BeginElemt[] = "\"elemts\":[";
+	fwrite(BeginElemt, sizeof(char), strlen(BeginElemt), fp);
+	char ElemtJson[] = "[%d, %d, %d],\n";
+	for (int i = 0; i < nelems; ++i)
+	{
+		sprintf(t_json, ElemtJson, elems[i * 3], elems[i * 3 + 1], elems[i * 3 + 2]);
+		fwrite(t_json, sizeof(char), strlen(t_json), fp);
+	}
+	fwrite(EndMap, sizeof(char), strlen(EndMap), fp);
+
+	fwrite(EndJson, sizeof(char), strlen(EndJson), fp);
+	fclose(fp);
+}
+
+int main(int argc, char* argv[])
+{
+	int width, height, i, j;
+	struct SVGPath* bg;
+	struct SVGPath* fg;
+	struct SVGPath* it;
+	float bounds[4], view[4], cx, cy, w, offx, offy;
+	float t = 0.0f, pt = 0.0f;
+	TESSalloc ma;
+	TESStesselator* tess = 0;
+	const int nvp = 3;
+	unsigned char* vflags = 0;
+#ifdef USE_POOL
+	struct MemPool pool;
+	unsigned char mem[1024 * 1024];
+	int nvflags = 0;
+#else
+	int allocated = 0;
+	double t0 = 0, t1 = 0;
+#endif
+	TESS_NOTUSED(argc);
+	TESS_NOTUSED(argv);
+
+	printf("loading...\n");
+	// Load assets
+	bg = svgParseFromFile("./Bin/bg.svg");
+	if (!bg) return -1;
+	fg = svgParseFromFile("./Bin/fg.svg");
+	if (!fg) return -1;
+
+	printf("go...\n");
+
+	// Flip y
+	for (it = bg; it != NULL; it = it->next)
+		for (i = 0; i < it->npts; ++i)
+			it->pts[i * 2 + 1] = -it->pts[i * 2 + 1];
+	for (it = fg; it != NULL; it = it->next)
+		for (i = 0; i < it->npts; ++i)
+			it->pts[i * 2 + 1] = -it->pts[i * 2 + 1];
+
+
+#ifdef USE_POOL
+
+	pool.size = 0;
+	pool.cap = sizeof(mem);
+	pool.buf = mem;
+	memset(&ma, 0, sizeof(ma));
+	ma.memalloc = poolAlloc;
+	ma.memfree = poolFree;
+	ma.userData = (void*)&pool;
+	ma.extraVertices = 256; // realloc not provided, allow 256 extra vertices.
+
+#else
+
+	t0 = glfwGetTime();
+
+	memset(&ma, 0, sizeof(ma));
+	ma.memalloc = stdAlloc;
+	ma.memfree = stdFree;
+	ma.userData = (void*)&allocated;
+	ma.extraVertices = 256; // realloc not provided, allow 256 extra vertices.
+
+	tess = tessNewTess(&ma);
+	if (!tess)
+		return -1;
+
+	tessSetOption(tess, TESS_CONSTRAINED_DELAUNAY_TRIANGULATION, 1);
+
+	// Offset the foreground shape to center of the bg.
+	offx = (bounds[2] + bounds[0]) / 2;
+	offy = (bounds[3] + bounds[1]) / 2;
+	for (it = fg; it != NULL; it = it->next)
+	{
+		for (i = 0; i < it->npts; ++i)
+		{
+			it->pts[i * 2] += offx;
+			it->pts[i * 2 + 1] += offy;
+		}
+	}
+
+	// Add contours.
+	for (it = bg; it != NULL; it = it->next)
+		tessAddContour(tess, 2, it->pts, sizeof(float) * 2, it->npts);
+	for (it = fg; it != NULL; it = it->next)
+		tessAddContour(tess, 2, it->pts, sizeof(float) * 2, it->npts);
+	if (!tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS, nvp, 2, 0))
+		return -1;
+
+	t1 = glfwGetTime();
+
+	printf("Time: %.3f ms\n", (t1 - t0) * 1000.0f);
+	printf("Memory used: %.1f kB\n", allocated / 1024.0f);
+
+#endif
+
+#ifdef USE_POOL
+	pool.size = 0; // reset pool
+	tess = tessNewTess(&ma);
+	if (tess)
+	{
+		tessSetOption(tess, TESS_CONSTRAINED_DELAUNAY_TRIANGULATION, cdt);
+
+		for (it = bg; it != NULL; it = it->next)
+			tessAddContour(tess, 2, it->pts, sizeof(float) * 2, it->npts);
+		for (it = fg; it != NULL; it = it->next)
+			tessAddContour(tess, 2, it->pts, sizeof(float) * 2, it->npts);
+
+		// First combine contours and then triangulate, this removes unnecessary inner vertices.
+		if (tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_BOUNDARY_CONTOURS, 0, 0, 0))
+		{
+			const float* verts = tessGetVertices(tess);
+			const int* vinds = tessGetVertexIndices(tess);
+			const int nverts = tessGetVertexCount(tess);
+			const int* elems = tessGetElements(tess);
+			const int nelems = tessGetElementCount(tess);
+
+			if (nverts > nvflags)
+			{
+				if (vflags)
+					free(vflags);
+				nvflags = nverts;
+				vflags = (unsigned char*)malloc(sizeof(unsigned char) * nvflags);
+			}
+
+			if (vflags)
+			{
+				// Vertex indices describe the order the indices were added and can be used
+				// to map the tesselator output to input. Vertices marked as TESS_UNDEF
+				// are the ones that were created at the intersection of segments.
+				// That is, if vflags is set it means that the vertex comes from intersegment.
+				for (i = 0; i < nverts; ++i)
+					vflags[i] = vinds[i] == TESS_UNDEF ? 1 : 0;
+			}
+
+			for (i = 0; i < nelems; ++i)
+			{
+				int b = elems[i * 2];
+				int n = elems[i * 2 + 1];
+				tessAddContour(tess, 2, &verts[b * 2], sizeof(float) * 2, n);
+			}
+			if (!tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS, nvp, 2, 0))
+				tess = 0;
+		}
+		else
+			tess = 0;
+	}
+#endif
+
+	if (tess)
+	{
+		const float* verts = tessGetVertices(tess);
+		const int* elems = tessGetElements(tess);
+		const int nverts = tessGetVertexCount(tess);
+		const int nelems = tessGetElementCount(tess);
+		PrintJson("D:/verts.json", verts, elems, nverts, nelems);
+	}
+
+	if (tess) tessDeleteTess(tess);
+
+	if (vflags)
+		free(vflags);
+
+	svgDelete(bg);
+	svgDelete(fg);
+
+	return 0;
+}
+
+/*
 int main(int argc, char *argv[])
 {
 	GLFWwindow* window;
@@ -102,9 +307,9 @@ int main(int argc, char *argv[])
 
 	printf("loading...\n");
 	// Load assets
-	bg = svgParseFromFile("../Bin/bg.svg");
+	bg = svgParseFromFile("./Bin/bg.svg");
 	if (!bg) return -1;
-	fg = svgParseFromFile("../Bin/fg.svg");
+	fg = svgParseFromFile("./Bin/fg.svg");
 	if (!fg) return -1;
 
 	printf("go...\n");
@@ -406,3 +611,4 @@ int main(int argc, char *argv[])
 	glfwTerminate();
 	return 0;
 }
+*/
